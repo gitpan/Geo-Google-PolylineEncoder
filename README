@@ -1,5 +1,5 @@
 NAME
-    Geo::Google::PolylineEncoder - encode lat/lngs to Google Maps Polylines
+    Geo::Google::PolylineEncoder - encode lat/lons to Google Maps Polylines
 
 SYNOPSIS
       use Geo::Google::PolylineEncoder;
@@ -111,12 +111,18 @@ TODO
     <http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/gmap_polyli
     ne_encoder.rb.txt>
 
+    As Lee Goddard suggests, accept points as arrays in inputs to encode(),
+    eg:
+
+     my $points = [ [$lat1, $lon1], ... ]; # like this
+     my $points = [ $lat1, $lon1, $lat2, $lon2 ]; # or this
+
 AUTHOR
     Steve Purkis <spurkis@cpan.org>
 
     Ported from Mark McClure's "PolylineEncoder.js" which can be found here:
     <http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/PolylineEnc
-    oder.html>
+    oderClass.html>
 
     Some encoding ideas borrowed from Geo::Google.
 
@@ -127,7 +133,7 @@ COPYRIGHT
 SEE ALSO
     <http://code.google.com/apis/maps/documentation/polylinealgorithm.html>,
     <http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/PolylineEnc
-    oder.html> (JavaScript implementation),
+    oderClass.html> (JavaScript implementation),
     <http://www.usnaviguide.com/google-encode.htm> (similar implementation
     in perl), Geo::Google, JSON
 

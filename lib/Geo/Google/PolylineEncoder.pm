@@ -1,6 +1,6 @@
 =head1 NAME
 
-Geo::Google::PolylineEncoder - encode lat/lngs to Google Maps Polylines
+Geo::Google::PolylineEncoder - encode lat/lons to Google Maps Polylines
 
 =head1 SYNOPSIS
 
@@ -36,7 +36,8 @@ use strict;
 use warnings;
 
 use accessors qw(num_levels zoom_factor visible_threshold force_endpoints
-		 zoom_level_breaks escape_encoded_points);
+		 zoom_level_breaks escape_encoded_points
+		 points dists max_dist encoded_points encoded_levels );
 use constant defaults => {
 			  num_levels  => 18,
 			  zoom_factor => 2,
@@ -44,7 +45,7 @@ use constant defaults => {
 			  escape_encoded_points => 0,
 			  visible_threshold => 0.00001,
 			 };
-our $VERSION = 0.03;
+our $VERSION = 0.04;
 
 # The constructor
 sub new {
@@ -64,72 +65,78 @@ sub init {
     foreach my $attr (keys %args) {
 	$self->$attr($args{$attr});
     }
+}
+
+sub init_zoom_level_breaks {
+    my $self = shift;
+
+    # Cache for performance:
+    my $num_levels = $self->num_levels;
 
     my @zoom_level_breaks;
-    for my $i (1 .. $self->num_levels) {
+    for my $i (1 .. $num_levels) {
 	push @zoom_level_breaks,
-	  $self->visible_threshold * $self->zoom_factor ** ($self->num_levels - $i);
+	  $self->visible_threshold * $self->zoom_factor ** ($num_levels - $i);
     }
 
     $self->zoom_level_breaks(\@zoom_level_breaks);
 }
 
-# The main function.  Essentially the Douglas-Peucker
-# algorithm, adapted for encoding. Rather than simply
-# eliminating points, we record their distance from the
-# segment which occurs at that recursive step.  These
-# distances are then easily converted to zoom levels.
-sub encode {
+sub reset_encoder {
+    my $self = shift;
+    $self->points([])->dists([])->max_dist(0)->encoded_points('')->encoded_levels('');
+    # Note: calculate zoom level breaks here in case num_levels, etc. have
+    # changed between encodes:
+    $self->init_zoom_level_breaks;
+}
+
+sub set_points {
     my ($self, $points) = @_;
 
-    my @stack;
-    my @dists;
-    my $abs_max_dist = 0;
+    $points->[0]->{first} = 1;
+    $points->[-1]->{last} = 1;
 
-    if(@$points > 2) {
-	push @stack, [0, @$points - 1];
-	while(@stack > 0) {
-	    my $current = pop @stack;
+    # For the moment, just stick the points we were given into $self->points:
+    return $self->points( $points );
 
-	    # create a line segment between p1 & p2 and calculate its length
-	    my $p1 = $points->[$current->[0]];
-	    my $p2 = $points->[$current->[1]];
-	    # cache the square of the seg length for use in calcs later...
-	    my $seg_length_squared = (($p2->{lat} - $p1->{lat}) ** 2 +
-				      ($p2->{lon} - $p1->{lon}) ** 2);
-	    my $seg_length = sqrt($seg_length_squared);
-
-	    my $max_dist = 0;
-	    my $max_dist_idx;
-	    for (my $i = $current->[0] + 1; $i < $current->[1]; $i++) {
-		my $dist = $self->distance($points->[$i], $p1, $p2, $seg_length, $seg_length_squared);
-		# See if this distance is the greatest for this segment so far:
-		if ($dist > $max_dist) {
-		    $max_dist = $dist;
-		    $max_dist_idx = $i;
-		    if ($max_dist > $abs_max_dist) {
-			$abs_max_dist = $max_dist;
-		    }
-		}
+    # TODO: make a copy of the points we were given, and do some clever logic
+    # ala:
+    my @points;
+    if (UNIVERSAL::isa($points->[0], 'HASH')) {
+	my @keys = keys %{ $points->[0] };
+	my ($lat_key) = grep( /^lat$/i, @keys );
+	my ($lon_key) = grep( /^(?:lon)|(?:lng)$/i, @keys );
+	@points = map { [$_->{$lat_key}, $_->{$lon_key}] } @$points;
+    } elsif (UNIVERSAL::isa($points->[0], 'ARRAY')) {
+	if ($self->points_in_geographic_order) {
+	    while (my ($lon, $lat) = splice( @$points, 0, 2 )) {
+		push @points, [$lat, $lon];
 	    }
-
-	    # If the point that had the greatest distance from the line seg is
-	    # also greater than our threshold, process again using it as a new
-	    # start/end point for the line.
-	    if ($max_dist > $self->visible_threshold) {
-		# store this distance - we'll use it later when creating zoom values
-		$dists[$max_dist_idx] = $max_dist;
-		push @stack, [$current->[0], $max_dist_idx];
-		push @stack, [$max_dist_idx, $current->[1]];
+	} else {
+	    while (my ($lat, $lon) = splice( @$points, 0, 2 )) {
+		push @points, [$lat, $lon];
 	    }
 	}
     } else {
-	# Do nothing with only 2 points
+	die "don't know how to handle points = $points";
     }
 
+    return $self;
+}
+
+# The main entry point
+sub encode {
+    my ($self, $points) = @_;
+
+    $self->reset_encoder
+         ->set_points( $points )
+	 ->calculate_distances
+	 ->encode_points
+	 ->encode_levels;
+
     my $eline = {
-		 points => $self->encode_points($points, \@dists),
-		 levels => $self->encode_levels($points, \@dists, $abs_max_dist),
+		 points => $self->encoded_points,
+		 levels => $self->encoded_levels,
 		 num_levels => $self->num_levels,
 		 zoom_factor => $self->zoom_factor,
 		};
@@ -142,93 +149,173 @@ sub encode {
     return $eline;
 }
 
+# The main function.  Essentially the Douglas-Peucker algorithm, adapted for
+# encoding.  Rather than simply eliminating points, we record their distance
+# from the segment which occurs at that recursive step.  These distances are
+# then easily converted to zoom levels.
+#
+# Note: this function has been optimized and is quite long, sorry.
+# Any further optimizations should probably be done in XS.
+sub calculate_distances {
+    my $self = shift;
+    my $points = $self->points;
 
-# distance(p0, p1, p2) computes the distance between the point p0 and the line
-# segment [p1, p2].  Maths borrowed from GMapPolylineEncoder.rb by Joel Rosenberg
-# bit more numerically stable.
-sub distance {
-    my ($self, $p, $a, $b, $seg_length, $seg_length_squared) = @_;
+    my @dists;
+    my $max_dist = 0;
 
-    my $dist;
-    my ($Py, $Px, $Ay, $Ax, $By, $Bx) =
-      ($p->{lat}, $p->{lon}, $a->{lat}, $a->{lon}, $b->{lat}, $b->{lon});
+    if (@$points <= 2) {
+	# no point doing distance calcs:
+	return $self->dists( \@dists )->max_dist( $max_dist );
+    }
 
-    # Approximate distance using flat (Euclidian) geometry, rather than
-    # trying to bring the curvature of the earth into it.  This greatly
-    # simplifies things...
-    #if ($Ay == $By && $Ax == $Bx) {
-    if ($seg_length == 0) {
-	# The line is really just a point, so calc dist between it and $p:
-	$dist = sqrt(($By - $Py) ** 2 + ($Bx - $Px) ** 2);
-    } else {
-	# Thanks to Philip Nicoletti's explanation:
-	#   http://www.codeguru.com/forum/printthread.php?t=194400
-	#
-	# So, to find out how far the line segment (AB) is from the point (P),
-	# let 'I' be the point of perpendicular projection of P on AB.  The
-	# parameter 'r' indicates I's position along AB, and is computed by
-	# the dot product of AP and AB divided by the square of the length
-	# of AB:
-	#
-	#       AP . AB      (Px-Ax)(Bx-Ax) + (Py-Ay)(By-Ay)
-        #   r = --------  =  -------------------------------
-	#       ||AB||^2                   L^2
-	#
-	# r can be interpreded ala:
-	#
-        #   r=0      I = A
-        #   r=1      I = B
-        #   r<0      I is on the backward extension of A-B
-        #   r>1      I is on the forward extension of A-B
-        #   0<r<1    I is interior to A-B
-	#
-	# In cases 1-4 we can simply use the distance between P and either A or B.
-	# In case 5 we can use the distance between I and P.  To do that we need to
-	# find I:
-	#
-	#   Ix = Ax + r(Bx-Ax)
-	#   Iy = Ay + r(By-Ay)
-	#
-	# And the distance from A to I = r*L.
-	# Use another parameter s to indicate the location along IP, with the 
-	# following meaning:
-        #    s<0      P is left of AB
-	#    s>0      P is right of AB
-	#    s=0      P is on AB
-	#
-	# Compute s as follows:
-	#
-	#       (Ay-Py)(Bx-Ax) - (Ax-Px)(By-Ay)
-        #   s = -------------------------------
-        #                     L^2
-	#
-	# Then the distance from P to I = |s|*L.
+    # Iterate through all the points, and calculate their dists
 
-	my $r = (($Px - $Ax) * ($Bx - $Ax) +
-		 ($Py - $Ay) * ($By - $Ay)) / $seg_length_squared;
-	if ($r >= 0.0 || $r <= 1.0) {
-	    # The perpendicular point intersects the line
-	    my $s = (($Ay - $Py) * ($Bx - $Ax) -
-		     ($Ax - $Px)*($By - $Ay)) / $seg_length_squared;
-	    $dist = abs($s) * $seg_length;
-	} else {
-	    # The point is closest to an endpoint. Find out which one:
-	    my $dist1 = ($Px - $Ax)**2 + ($Py - $Ay)**2;
-	    my $dist2 = ($Px - $Bx)**2 + ($Py - $By)**2;
-	    # avoid doing sqrts:
-	    $dist = ($dist1 < $dist2) ? sqrt($dist1) : sqrt($dist2);
+    # Each stack element contains the index of two points representing a line
+    # seg that we calculate distances from.  Start off with the first & last pt:
+    my @stack = ([0, @$points - 1]);
+
+    while (@stack > 0) {
+	my $current = pop @stack;
+
+	# Get the two points, $A & $B:
+	my ($A, $B) = ($points->[$current->[0]], $points->[$current->[1]]);
+
+	# Cache their lon/lats to avoid unneccessary hash lookups.
+	# Note: we use X/Y because it's shorter, and more math-y
+	my ($Ax, $Ay, $Bx, $By) = ($A->{lon}, $A->{lat}, $B->{lon}, $B->{lat});
+
+	# Create a line segment between $A & $B and calculate its length
+	# Note: cache the square of the seg length for use in calcs later...
+	my $seg_length_squared = (($Bx - $Ax) ** 2 + ($By - $Ay) ** 2);
+	my $seg_length = sqrt($seg_length_squared);
+
+	# Cache the deltas in x/y for calcs later:
+	my ($Bx_minus_Ax, $By_minus_Ay) = ($Bx - $Ax, $By - $Ay);
+
+	my $current_max_dist = 0;
+	my $current_max_dist_idx;
+	for (my $i = $current->[0] + 1; $i < $current->[1]; $i++) {
+	    # Get the current point:
+	    my $P = $points->[$i];
+
+	    # Cache its lon/lat to avoid unneccessary hash lookups.
+	    # Note: we use X/Y because it's shorter, and more math-y
+	    my ($Py, $Px) = ($P->{lat}, $P->{lon});
+
+	    # Compute the distance between point $P and line segment [$A, $B].
+	    # Maths borrowed from Philip Nicoletti (see below).
+	    #
+	    # Note: we approximate distance using flat (Euclidian) geometry,
+	    # rather than trying to bring the curvature of the earth into it.
+	    # This greatly simplifies things, and makes the calcs faster...
+	    #
+	    # Note: distance calculations have been brought in-line as the
+	    # majority of encoding time was spent calling the 'distance'
+	    # method.  This way we can avoid passing lots of data by value,
+	    # setting up the sub stack, and we can also cache some values.
+	    #my $dist = $self->distance($points->[$i], $A, $B, $seg_length, $seg_length_squared);
+
+	    my $dist;
+	    if ($seg_length == 0) {
+		# The line is really just a point, so calc dist between it and $P:
+		$dist = sqrt(($By - $Py) ** 2 + ($Bx - $Px) ** 2);
+	    } else {
+		# Thanks to Philip Nicoletti's explanation:
+		#   http://www.codeguru.com/forum/printthread.php?t=194400
+		#
+		# So, to find out how far the line segment (AB) is from the point (P),
+		# let 'I' be the point of perpendicular projection of P on AB.  The
+		# parameter 'r' indicates I's position along AB, and is computed by
+		# the dot product of AP and AB divided by the square of the length
+		# of AB:
+		#
+		#       AP . AB      (Px-Ax)(Bx-Ax) + (Py-Ay)(By-Ay)
+		#   r = --------  =  -------------------------------
+		#       ||AB||^2                   L^2
+		#
+		# r can be interpreded ala:
+		#
+		#   r=0      I = A
+		#   r=1      I = B
+		#   r<0      I is on the backward extension of A-B
+		#   r>1      I is on the forward extension of A-B
+		#   0<r<1    I is interior to A-B
+		#
+		# In cases 1-4 we can simply use the distance between P and either A or B.
+		# In case 5 we can use the distance between I and P.  To do that we need to
+		# find I:
+		#
+		#   Ix = Ax + r(Bx-Ax)
+		#   Iy = Ay + r(By-Ay)
+		#
+		# And the distance from A to I = r*L.
+		# Use another parameter s to indicate the location along IP, with the 
+		# following meaning:
+		#    s<0      P is left of AB
+		#    s>0      P is right of AB
+		#    s=0      P is on AB
+		#
+		# Compute s as follows:
+		#
+		#       (Ay-Py)(Bx-Ax) - (Ax-Px)(By-Ay)
+		#   s = -------------------------------
+		#                     L^2
+		#
+		# Then the distance from P to I = |s|*L.
+
+		my $r = (($Px - $Ax) * ($Bx - $Ax) +
+			 ($Py - $Ay) * ($By - $Ay)) / $seg_length_squared;
+
+		if ($r <= 0.0) {
+		    # Either I = A, or I is on the backward extension of A-B,
+		    # so find dist between $P & $A:
+		    $dist = sqrt(($Ay - $Py) ** 2 + ($Ax - $Px) ** 2);
+		} elsif ($r >= 1.0) {
+		    # Either I = B, or I is on the forward extension of A-B,
+		    # so find dist between $P & $B:
+		    $dist = sqrt(($By - $Py) ** 2 + ($Bx - $Px) ** 2);
+		} else {
+		    # I is interior to A-B, so find $s, and use it to find the
+		    # dist between $P and A-B:
+		    my $s = (($Ay - $Py) * $Bx_minus_Ax -
+			     ($Ax - $Px) * $By_minus_Ay) / $seg_length_squared;
+		    $dist = abs($s) * $seg_length;
+		}
+	    }
+
+	    # See if this distance is the greatest for this segment so far:
+	    if ($dist > $current_max_dist) {
+		$current_max_dist = $dist;
+		$current_max_dist_idx = $i;
+		if ($current_max_dist > $max_dist) {
+		    $max_dist = $current_max_dist;
+		}
+	    }
+	}
+
+	# If the point that had the greatest distance from the line seg is
+	# also greater than our threshold, process again using it as a new
+	# start/end point for the line.
+	if ($current_max_dist > $self->visible_threshold) {
+	    # store this distance - we'll use it later when creating zoom values
+	    $dists[$current_max_dist_idx] = $current_max_dist;
+	    push @stack, [$current->[0], $current_max_dist_idx];
+	    push @stack, [$current_max_dist_idx, $current->[1]];
 	}
     }
 
-    return $dist;
-}
+    $self->dists( \@dists )->max_dist( $max_dist );
+} # calculate_distances
+
 
 # The encode_points function is very similar to Google's
 # http://www.google.com/apis/maps/documentation/polyline.js
 # The key difference is that not all points are encoded,
 # since some were eliminated by Douglas-Peucker.
 sub encode_points {
-    my ($self, $points, $dists) = @_;
+    my $self = shift;
+    my $points = $self->points;
+    my $dists  = $self->dists;
 
     my $encoded_points = "";
     my $oldencoded_points = "";
@@ -251,7 +338,7 @@ sub encode_points {
 	}
     }
 
-    return $encoded_points;
+    $self->encoded_points( $encoded_points );
 }
 
 
@@ -259,47 +346,77 @@ sub encode_points {
 # Like encode_points, we ignore points whose distance (in dists) is undefined.
 # See http://code.google.com/apis/maps/documentation/polylinealgorithm.html
 sub encode_levels {
-    my ($self, $points, $dists, $abs_max_dist) = @_;
+    my $self = shift;
+    my $points = $self->points;
+    my $dists  = $self->dists;
+    my $max_dist = $self->max_dist;
 
-    my $i;
+    # Cache for performance:
+    my $num_levels = $self->num_levels;
+    my $num_levels_minus_1 = $num_levels - 1;
+    my $visible_threshold = $self->visible_threshold;
+    my $zoom_level_breaks = $self->zoom_level_breaks;
+
     my $encoded_levels = "";
+
     if ($self->force_endpoints) {
-	$encoded_levels .= $self->encode_number($self->num_levels - 1);
+	$encoded_levels .= $self->encode_number($num_levels_minus_1);
     } else {
-	$encoded_levels .= $self->encode_number($self->num_levels - $self->compute_level($abs_max_dist) - 1);
+	$encoded_levels .= $self->encode_number($num_levels_minus_1 - $self->compute_level($max_dist));
     }
 
-    for ($i=1; $i < @$points - 1; $i++) {
-	if (defined $dists->[$i]) {
-	    $encoded_levels .= $self->encode_number($self->num_levels - $self->compute_level($dists->[$i]) - 1);
+
+    # Note: skip the first & last point:
+    for my $i (1 .. scalar(@$points) - 2) {
+	my $dist = $dists->[$i];
+	if (defined $dist) {
+	    # Note: brought compute_level in-line as it was performing *really* slowly
+	    #
+	    # This computes the appropriate zoom level of a point in terms of it's
+	    # distance from the relevant segment in the DP algorithm.  Could be done
+	    # in terms of a logarithm, but this approach makes it a bit easier to
+	    # ensure that the level is not too large.
+	    #my $level = $self->compute_level($dist);
+	    my $level = 0;
+	    if ($dist > $visible_threshold) {
+		while ($dist < $zoom_level_breaks->[$level]) {
+		    $level++;
+		}
+	    }
+
+	    $encoded_levels .= $self->encode_number($num_levels_minus_1 - $level);
 	}
     }
 
     if ($self->force_endpoints) {
-	$encoded_levels .= $self->encode_number($self->num_levels - 1);
+	$encoded_levels .= $self->encode_number($num_levels_minus_1);
     } else {
-	$encoded_levels .= $self->encode_number($self->num_levels - $self->compute_level($abs_max_dist) - 1);
+	$encoded_levels .= $self->encode_number($num_levels_minus_1 - $self->compute_level($max_dist));
     }
 
-    return $encoded_levels;
+    $self->encoded_levels( $encoded_levels );
 }
 
 
-# This computes the appropriate zoom level of a point in terms of it's 
+# This computes the appropriate zoom level of a point in terms of it's
 # distance from the relevant segment in the DP algorithm.  Could be done
 # in terms of a logarithm, but this approach makes it a bit easier to
 # ensure that the level is not too large.
 sub compute_level {
-    my ($self, $dd) = @_;
+    my ($self, $dist) = @_;
 
-    my $lev;
-    if($dd > $self->visible_threshold) {
-	$lev = 0;
-	while ($dd < $self->zoom_level_breaks->[$lev]) {
-	    $lev++;
+    # Cache for performance:
+    my $zoom_level_breaks = $self->zoom_level_breaks;
+
+    my $level;
+    if ($dist > $self->visible_threshold) {
+	$level = 0;
+	while ($dist < $zoom_level_breaks->[$level]) {
+	    $level++;
 	}
-	return $lev;
     }
+
+    return $level;
 }
 
 # Based on the official google example
@@ -472,12 +589,17 @@ values to your Javascript application for use there.
 Benchmarking, & maybe bring distance calcs in-line as Joel Rosenberg did:
 L<http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/gmap_polyline_encoder.rb.txt>
 
+As Lee Goddard suggests, accept points as arrays in inputs to encode(), eg:
+
+ my $points = [ [$lat1, $lon1], ... ]; # like this
+ my $points = [ $lat1, $lon1, $lat2, $lon2 ]; # or this
+
 =head1 AUTHOR
 
 Steve Purkis <spurkis@cpan.org>
 
 Ported from Mark McClure's C<PolylineEncoder.js> which can be found here:
-L<http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/PolylineEncoder.html>
+L<http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/PolylineEncoderClass.html>
 
 Some encoding ideas borrowed from L<Geo::Google>.
 
@@ -489,7 +611,7 @@ Released under the same terms as Perl itself.
 =head1 SEE ALSO
 
 L<http://code.google.com/apis/maps/documentation/polylinealgorithm.html>,
-L<http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/PolylineEncoder.html>
+L<http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/PolylineEncoderClass.html>
 (JavaScript implementation),
 L<http://www.usnaviguide.com/google-encode.htm> (similar implementation in perl),
 L<Geo::Google>,

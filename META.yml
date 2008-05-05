@@ -1,9 +1,9 @@
 ---
 name: Geo-Google-PolylineEncoder
-version: 0.03
+version: 0.04
 author:
   - 'Steve Purkis <spurkis@cpan.org>'
-abstract: encode lat/lngs to Google Maps Polylines
+abstract: encode lat/lons to Google Maps Polylines
 license: perl
 resources:
   license: http://dev.perl.org/licenses/
@@ -18,7 +18,7 @@ build_requires:
 provides:
   Geo::Google::PolylineEncoder:
     file: lib/Geo/Google/PolylineEncoder.pm
-    version: 0.03
+    version: 0.04
 generated_by: Module::Build version 0.2808
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.2.html
