@@ -6,24 +6,59 @@ use lib 't/lib';
 
 use Test::More 'no_plan';
 
-use IO::File;
-use Geo::Gpx;
 use_ok( 'Geo::Google::PolylineEncoder' );
+
+# RT #49327
+# Result of encode_signed_number wrong for small negative numbers
+{
+    my $test_number = -0.000001;
+    my $r = Geo::Google::PolylineEncoder->encode_signed_number($test_number);
+    is( $r, chr(63), 'encode_signed_number( -0.000001 ) - RT 49327' );
+}
+
+# test the basic encoding functions
+{
+    my $enc = Geo::Google::PolylineEncoder->new;
+    # example from http://code.google.com/apis/maps/documentation/polylinealgorithm.html
+    is( $enc->encode_number( 17 ), 'P', 'encode_number: 17' );
+    is( $enc->encode_number( 174 ), 'mD', 'encode_number: 174' );
+    is( $enc->encode_signed_number( -179.9832104 ), '`~oia@', 'encode_signed_number: -179.9832104' );
+
+    # this example was being encoded differently by both:
+    # 'krchI' - http://code.google.com/apis/maps/documentation/polylineutility.html
+    # 'irchI' - http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/encodeForm.html
+    # double-checked the polyline algorithm docs, seems they changed from using
+    # floor() to using round(), so going with the first.
+    is( $enc->encode_signed_number( 53.926935 ), 'krchI', 'encode_signed_number: 53.926935' );
+
+    # trying to show that this number was encoded wrong, but it's right... ?
+    # yet it appears wrong in Test 2 below?
+    #      got: krchIwzo}@EqKa...
+    # expected: krchIwzo}@CqKa...
+    # why?
+    is( $enc->encode_signed_number( 53.92696 ), 'orchI', 'encode_signed_number: 53.92696' );
+}
 
 # Test 1 - basic polyline with 3 points
 # example from http://code.google.com/apis/maps/documentation/polylinealgorithm.html
 {
-    my @points = [
-		  { lat => 38.5, lon => -120.2 },
-		  { lat => 40.7, lon => -120.95 },
-		  { lat => 43.252, lon => -126.453 },
+    my $points = [
+		  { lat => 38.5, lon => -120.2 }, # lvl 17
+		  { lat => 40.7, lon => -120.95 }, # lvl 16
+		  { lat => 43.252, lon => -126.453 }, # lvl 17
 		 ];
     my $encoder = Geo::Google::PolylineEncoder->new(zoom_factor => 2, num_levels => 18);
-    my $eline   = $encoder->encode( @points );
+    my $eline   = $encoder->encode( $points );
     is( $eline->{num_levels}, 18, 'ex1 num_levels' );
     is( $eline->{zoom_factor}, 2, 'ex1 zoom_factor' );
     is( $eline->{points}, '_p~iF~ps|U_ulLnnqC_mqNvxq`@', 'ex1 points' );
     is( $eline->{levels}, 'POP', 'ex1 levels' );
+
+    my $d_points = $encoder->decode_points( $eline->{points} );
+    my $d_levels = $encoder->decode_levels( $eline->{levels} );
+    is( scalar @$d_points, scalar @$d_levels, 'decode: num levels == num points' );
+    is_deeply( $d_points, $points, 'decode_points' );
+    is_deeply( $d_levels, [ 17, 16, 17 ], 'decode_levels' );
 }
 
 # Test 1a - polyline with only 2 points
@@ -38,130 +73,107 @@ use_ok( 'Geo::Google::PolylineEncoder' );
     is( $eline->{num_levels}, 18, 'ex1a num_levels' );
     is( $eline->{zoom_factor}, 2, 'ex1a zoom_factor' );
     is( $eline->{points}, '_p~iF~ps|U_ulLnnqC', 'ex1a points' );
-    is( $eline->{levels}, 'PP', 'ex1 levels' );
+    is( $eline->{levels}, 'PP', 'ex1a levels' );
 }
 
-# Test 2 - polyline with 10 points that kept on encoding incorrectly because I
-# set escape_encoded_line => 1 by default.  This naturally screws things up...
-# To illustrate, I've included decoded (D) points from:
-#  http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/decode.html
-# and points actually seen on the polyline (G)
+# Test 1b - arrayref as input
 {
-    my $points = [
-		  { lat => 53.926935, lon => 10.244442 },
-		  #D: 53.92694, 10.24444
-		  #G: 53.92694, 10.24444
-		  { lat => 53.92696, lon => 10.246454 },
-		  #D: 53.926970000000004, 10.246450000000001
-		  #G: 53.926970000000004, 10.246450000000001
-		  { lat => 53.927131, lon => 10.248521 },
-		  #D: 53.92714, 10.248510000000001
-		  #G: 53.92714, 10.248510000000001
-		  { lat => 53.927462, lon => 10.250555 },
-		  #D: 53.92747000000001, 10.25054
-		  #G: 53.92747000000001, 10.25054
-		  { lat => 53.928056, lon => 10.253243 },
-		  #D: 53.92806, 10.25323
-		  #G: 53.92806, 10.25323
-		  { lat => 53.928511, lon => 10.25511 },
-		  { lat => 53.929217, lon => 10.257998 },
-		  #D: 53.92922000000001, 10.257990000000001
-		  #G: 53.92922000000001, 10.257990000000001
-		  { lat => 53.930089, lon => 10.261353 },
-		  # ****** THINGS START DIFFERING HERE *******
-		  #D: 53.93009000000001, 10.26134
-		  #G: 53.92907, 10.25886
-		  { lat => 53.930831, lon => 10.263948 },
-		  #D: 53.93083000000001, 10.26393
-		  #G: 53.93242000000001, 10.2596
-		  { lat => 53.931672, lon => 10.266299 },
-		  { lat => 53.93273, lon => 10.269256 },
-		  #D: 53.93273000000001, 10.269240000000002
-		  #G: 53.935010000000005, 10.261500000000002
-		  { lat => 53.933209, lon => 10.271115 },
-		  #D: 53.93321, 10.2711
-		  #G: 53.94032000000001, 10.261980000000001
-		  #G: 53.94218000000001, 10.261970000000002
+    my @points = [ # lat, lon
+		  [ 38.5, -120.2 ],
+		  [ 40.7, -120.95 ],
 		 ];
+    my $encoder = Geo::Google::PolylineEncoder->new(zoom_factor => 2, num_levels => 18);
+    my $eline   = $encoder->encode( @points );
+    is( $eline->{points}, '_p~iF~ps|U_ulLnnqC', 'ex1b points' );
+    is( $eline->{levels}, 'PP', 'ex1b levels' );
+}
+
+# Test 1c - arrayref as input
+{
+    my @points = [ # lat, lon
+		  [ -120.2, 38.5 ],
+		  [ -120.95, 40.7 ],
+		 ];
+    my $encoder = Geo::Google::PolylineEncoder->new(zoom_factor => 2, num_levels => 18, lons_first => 1 );
+    my $eline   = $encoder->encode( @points );
+    is( $eline->{points}, '_p~iF~ps|U_ulLnnqC', 'ex1c points' );
+    is( $eline->{levels}, 'PP', 'ex1c levels' );
+}
+
+# Test 2 - polyline with 12 points that kept on encoding incorrectly because I
+# set escape_encoded_line => 1 by default.  This naturally screws things up...
+# Also check that visible_threshold has desired effect
+{
+    my @points = (
+		  { lat => 53.926935, lon => 10.244442 },
+		  { lat => 53.926960, lon => 10.246454 },
+		  { lat => 53.927131, lon => 10.248521 },
+		  { lat => 53.927462, lon => 10.250555 },
+		  { lat => 53.928056, lon => 10.253243 },
+		  { lat => 53.928511, lon => 10.255110 }, # skipped @ default visible_threshold
+		  { lat => 53.929217, lon => 10.257998 },
+		  { lat => 53.930089, lon => 10.261353 },
+		  { lat => 53.930831, lon => 10.263948 },
+		  { lat => 53.931672, lon => 10.266299 }, # skipped @ default visible_threshold
+		  { lat => 53.932730, lon => 10.269256 },
+		  { lat => 53.933209, lon => 10.271115 },
+		 );
 
     my $encoder = Geo::Google::PolylineEncoder->new(zoom_factor => 2, num_levels => 18);
-    my $eline   = $encoder->encode( $points );
+    my $eline   = $encoder->encode( \@points );
     is( $eline->{num_levels}, 18, 'ex2 num_levels' );
     is( $eline->{zoom_factor}, 2, 'ex2 zoom_factor' );
-    is( $eline->{points}, 'krchIwzo}@EqKa@}KaAuKuByOgFw\\mD}SsCeO{Je`@_BsJ', 'ex2 points' );
-    is( $eline->{levels}, 'PADAEA@CBP', 'ex2 levels' );
+    is( $eline->{points}, 'krchIwzo}@CqKa@}KaAwKwBwOgFw\\mD}SsCgO{Je`@_BqJ', 'ex2 points' ); # bootstrapped
+    is( $eline->{levels}, 'PADAEA@CBP', 'ex2 levels' ); # bootstrapped
+
+    my $ipeu = 'krchIwzo}@CqKa@}KaAwKwBwOgFw\\mD}SsCgO{Je`@_BsJ'; # from google
+    my $ipeu_points = $encoder->decode_points( $ipeu );
+    my $d_points = $encoder->decode_points( $eline->{points} );
+    my $d_levels = $encoder->decode_levels( $eline->{levels} );
+    is( scalar @$d_points, scalar @$d_levels, 'decode ex2: num levels == num points' );
+    is( scalar @$d_points, scalar( @points ) - 2, 'decode ex2: num points == orig num - 2' );
+    is( scalar @$d_points, scalar @$ipeu_points, 'decode ex2: num points == num ipeu points' );
+
+  SKIP: {
+	eval "use Test::Approx";
+	skip 'Test::Approx not available', scalar( @$d_points ) * 2 if $@;
+
+	# compare the decoded & ipeu points, should be only rounding diffs
+	for my $i (0 .. $#{$d_points}) {
+	    my ($Pa, $Pc) = ($d_points->[$i], $ipeu_points->[$i]);
+	    is_approx_num( $Pa->{lon}, $Pc->{lon}, "ex2: d.lon[$i] =~ ipeu.lon[$i]", 1.2e-5 );
+	    is_approx_num( $Pa->{lat}, $Pc->{lat}, "ex2: d.lat[$i] =~ ipeu.lat[$i]", 1.2e-5 );
+	}
+    }
+
+
+    # now test all points & compare
+    $eline = $encoder->visible_threshold( 0.00000001 )->encode( \@points );
+    is( $eline->{points}, 'krchIwzo}@CqKa@}KaAwKwBwOyAuJmCaQmD}SsCgOgDuMsEoQ_BqJ', 'ex2 all points' ); # bootstrapped
+    is( $eline->{levels}, 'PKMKOEKJMBLP', 'ex2 all levels' );
+
+    my $ipeu_all = 'krchIwzo}@CqKa@}KaAwKwBwOyAuJmCaQmD}SsCgOgDuMsEoQ_BsJ'; # from google
+    $ipeu_points = $encoder->decode_points( $ipeu_all );
+    $d_points = $encoder->decode_points( $eline->{points} );
+    $d_levels = $encoder->decode_levels( $eline->{levels} );
+    is( scalar @$d_points, scalar @$d_levels, 'decode ex2 all: num levels == num points' );
+    is( scalar @$d_points, scalar( @points ), 'decode ex2 all: num points == orig num' );
+    is( scalar @$d_points, scalar @$ipeu_points, 'decode ex2 all: num points == num ipeu points' );
+
+  SKIP: {
+	eval "use Test::Approx";
+	skip 'Test::Approx not available', scalar( @points ) * 4 if $@;
+
+	# compare the decoded, original & ipeu points, should be only rounding diffs
+	for my $i (0 .. $#points) {
+	    my ($Pa, $Pb, $Pc) = ($d_points->[$i], $points[$i], $ipeu_points->[$i]);
+	    is_approx_num( $Pa->{lon}, $Pb->{lon}, "ex2 all: d.lon[$i] =~ orig.lon[$i]", 1e-5 );
+	    is_approx_num( $Pa->{lat}, $Pb->{lat}, "ex2 all: d.lat[$i] =~ orig.lat[$i]", 1e-5 );
+	    is_approx_num( $Pa->{lon}, $Pc->{lon}, "ex2 all: d.lon[$i] =~ ipeu.lon[$i]", 1.2e-5 );
+	    is_approx_num( $Pa->{lat}, $Pc->{lat}, "ex2 all: d.lat[$i] =~ ipeu.lat[$i]", 1.2e-5 );
+	}
+    }
+
 }
-
-# Test 3
-# A basic encoded polyline with ~100 points
-{
-    my $filename = 't/data/20061228.gpx';
-    my $fh = IO::File->new( $filename );
-    my $gpx = Geo::Gpx->new( input => $fh );
-
-    my @track_points;
-    my $iter = $gpx->iterate_trackpoints;
-    while (my $pt = $iter->()) {
-	push @track_points, $pt;
-    }
-
-    my $encoder = Geo::Google::PolylineEncoder->new(zoom_factor => 2, num_levels => 18);
-    my $eline   = $encoder->encode( \@track_points );
-    is( $eline->{num_levels}, 18, 'ex3 num_levels' );
-    is( $eline->{zoom_factor}, 2, 'ex3 zoom_factor' );
-    is( $eline->{points}, '{w}yHtP~MbEDzAECDf@HPh@N^ZTrAB`GA|DlF]pJ_BhBa@RI|AOvDyAhFkCPG`D_@hFU`@Ub@Kh@HVfCj@fE\zCI@PbAL`@f@|@d@^ZLj@HnDoAhGQRv@?LLrBpAvHbAjAdBlCrBfFTdFvA|SlA|J@^AST~@l@IxEcB`@WCAFST[b@Y`@EJj@SP_@LSv@?j@FnA@_@Hd@HV', 'ex3 points' );
-    is( $eline->{levels}, 'PF@?C@@BD?GBA?ADA?CAB@BH??AB?AF@ADCFA?AD@BE@B?FBBCBA?@BAFB@BC?BB?P', 'ex3 levels' );
-}
-
-
-# Tests 4 & 5
-# Borrowed from:
-# http://facstaff.unca.edu/mcmcclur/GoogleMaps/EncodePolyline/examples.html
-# We test for approximately equal as the encoding algorithms differ
-SKIP: {
-    eval 'use Test::Approx';
-    skip 'Test::Approx not available', 8 if ($@);
-
-    # load data for first two examples:
-    my $filename = 't/data/MtMitchell.gpx';
-    my $fh = IO::File->new( $filename );
-    my $gpx = Geo::Gpx->new( input => $fh );
-
-    my @track_points;
-    my $iter = $gpx->iterate_trackpoints;
-    while (my $pt = $iter->()) {
-	push @track_points, $pt;
-    }
-
-    # Example 4
-    # A basic encoded polyline with about 700 points
-    {
-	my $encoder = Geo::Google::PolylineEncoder->new(zoom_factor => 2, num_levels => 18);
-	my $eline   = $encoder->encode( \@track_points );
-	my $expect_points = '_gkxEv}|vNM]kB}B}@q@YKg@IqCGa@EcA?cAGg@Ga@q@q@aAg@UYGa@A]WYYw@cAUe@Oi@MgB?o@Do@\\yANoA?w@Ck@?kFBm@?_BDm@?gBBm@?s@Bo@BmGJ[Ao@?gTRsF?s@F}AIYg@Oo@IeAG]GyAMiDi@w@GkD?yAQs@AkB[MOkA_BYg@[aA}@kBwBaE{B}EYc@{@kBWg@eAk@i@e@k@?[Kc@c@Q]Us@Da@Na@lA]Fi@q@mA@g@Nm@I}@QoAi@{BUn@MbAWn@Yf@Qb@MvB@f@Id@Wn@}@dBU`@Wf@wAzBm@fA]HCc@XoC?s@Fe@f@aBJg@Tg@T[t@sBFs@Ga@Lc@~@oGLc@VmAf@aA\\QbA_@hCsA~@Y\\I~DcAZDb@PrC}@VMj@MXOh@Ir@[f@GFm@LW^]f@Yb@]x@i@uArHBpBmAl@Cd@E`@Vn@h@XbBNp@KhBeCnAaBNYzAoBnChJMd@?h@LX\\ZdC?d@H`@PdATjAF\\?`@YjBgA|AiAe@KMk@Hm@?k@Bc@\\Yr@y@zDaDK}AsB~B_AJwCzCk@BsAnB_AJ_F`DmDaFM_JsBeAfAgAGoCxJjIv@HjHoBn@e@p@wCxA^dAUfCeDjG}DYaAkIcJaFcC{@QuCdCcEJyI[iKwAUyE_J{KoDsFC{Cd@cApHkCyDuSkAaPbAeLnFkGrB{DdDsBL_A{@kC]}EsBp@yB@gIqA}FAw@c@E{CvAiEcEgLs@i@kDtAg@c@q@eQuCyJ{@k@mCCm@w@wCuNm@_@eIWoBiA}A{D]wC_BwE_AgS]{@kFuCcAB{@h@o@dA}AhIoDjDcCxAoAJ{JyCoDNoAa@cD{HiG_FaCBuElAq@kHZqPUwC_A_CiMlD{BFeC}@{@{@wA{DuFRyB]iCkDsBsAyBh@mEtC}BTcC_@uJiOe@aKk@cAsBgA{DWqB{@_DoDyFuLcHaDaBwBsEoPCwAlAaCr@e@lGwBn@cCQwC_EcNUqCTmC~CwKnAwBnBuAjSaFbFmHzFwD~CyEnH]tDqAnEkHhHwGD}Cm@cDyAcC}FaCcCuIoBmAyFv@mK~G_Cx@yJ`AsBe@yHyJwKcDmCcC]cAr@aEFyCbBaJq@mCaB_B{DF}Hw@aBxAi@lCiAtB_AL}HuCgG{@sBqA{CqF_@{Cf@cDvEqI|@oHgAaCwHmCe@_AVaISyCqDiI_GwEYyCvBgHCeFXaAvBqAdIg@hBaAlAwBn@oIq@sF{DyEkCu@qE[a@o@UyCn@sHQaAy@m@eAMuJhCwBA_CeEaEaA}OsJ_CwC_AeCGgAr@cFUyCyFsF_EeAsKhA{DEiTmEcBeBuE{M_H_L?cDlAkHY}CuAmEGyCfHqQ\\uTNcDv@mCr@q@hCg@hPdC`C?jNmE~Ld@xFs@zGsCtJkGnAkBOkC}AyAeDmAeLiBgKuJyBzB}@HiR_@sQsFgByAoAcHmAoBuWBkBy@b@ZoAoA}@eCe@gC]gK}BwF_L}HuGuH}LoJ}CeGkEgO_CsDkDoBiIaAgBmAsDwEiF{BgEuD{JcE]cA?kFg@_DaAgCoCyD}FuDqIoCuDsBwJ}AuFwDaBe@{DMsFhAw@Y{@kAg@oKsFeNgAeJkBsCuPeEaG_CkH_F{IiIeCe@wFCqA}AsAsGaByAcEQgYzG{@KqA}Bw@oI{BmMd@{@xA}AbFuClIiIfFmLrK{DzFwEbF{BfByAdHyJbBmGvAeBrBO~Db@xBc@`A}BtAeHhCgGz@mLlCoHjBkC|@u@rIqDxCeE`@_DUgCuFoIm@yCDuAvDsI`BaHbDqFdBqGv@_@|Fp@l@_@j@oA?uAkD_Nw@uF|DiV`BgB~BgAxHeBn@eAh@}CKkDuDcFWoAm@_KHkHhAsC`ByBrIeGvDiG~BaC~LsHJoAwIt@cHKu@d@kA`CcBdBgRnIyGbGwBt@{KEm@e@U{CdByNw@uEaBsAoFVkF{@{@T}DnDiKrDuJ`@{@e@a@{@]{Cc@w@eHyAoFgF{@WyMJkJ{@wD_AuH|@oHEsFgO_B{AcF}BgC\\oFfC{@Bs@a@sDoH_CgD_F}CaKY{KhEaGrDC_ApBsAtB_ETkCc@{@cE_DsDkHsDmEwE{BoDY{DoHTeAvBHxAxAm@f@y@E';
-	my $expect_levels = 'P@B@D??@@?D?CA?B?CA?G@B@@B??@???A??@AA?B??AH@???@B@A@BAG?A?A@@??D@BAB@EACBBDC@AB@G@A??C@@D???A@BI@@@C?A?@C@B@B?AG?@@C?C@C???@?@D@B???GBCC?BGABE???FCAAEBB??B?G?@DBC@?D?@DGBBBBCBGDDDCGBFDBDBDCIBCFCCDBFDAHBDFCFEBCEBBIBDCBGCEECCEDFBCEEBECFBCBHCFACDBFCCBHDEBFCCBGBFBCDBEBEBDBGDBFBBECDCIBFBCCFBBEBHBDECCECFCEBJCDCGDBECGDCFCBBECGBECBCFCBHCECCFCCEBEDCGCBFCDBFCIDBCFBDBFBBFDCFBDBBEGDBDFCCJBDBBEE@CHBDBDDCFBECJBCDFBDEFCBFCCHBDBCFCCECCFCDBDCCFBBDBGCBCCBECBGCDCCHBEBEBECCGDECKBCGBBDECBBECBFBCFBBCCFACCGBDDBGBCBFCDAGBBEFBCDBFCBDBGBDCBDCJBEBBDCECHCDDCGCEBCDGBCBDDBFCBDBFCFEBBFBACGEBHCBCFBCBECECECDBP';
-	is( $eline->{num_levels}, 18, 'ex4 num_levels' );
-	is( $eline->{zoom_factor}, 2, 'ex4 zoom_factor' );
-	is_approx( $eline->{points}, $expect_points, 'ex4 points', '25%' );
-	is_approx( $eline->{levels}, $expect_levels, 'ex4 levels', '1%' );
-    }
-
-    # Example 5
-    # The same polyline but using the parameters visible_threshold=0.00008, num_levels=9, and zoom_factor=4
-    # viewable_distance_threshold
-    # visible_threshold
-    {
-	my $encoder = Geo::Google::PolylineEncoder->new(zoom_factor => 4, num_levels => 9, visible_threshold => 0.00008);
-	my $eline   = $encoder->encode( \@track_points );
-	my $expect_points = '_gkxEv}|vNyB{CwA}@kKg@sAsBcB_@w@q@}AsCMwCr@yEl@gdA_MaBqJ[yBk@aPm[oBqAgAKu@aAOuANa@lA]Fi@q@mAFsC{@kEgBnFUdEiGbL]H\\mGtCaI?uAlAsHlAsDjH_D|EmA~@VvJwCTeAdD_CuArHBpBmAl@IfAVn@lCh@p@KdHqJnChJ?hB\\ZdC?lCp@hBFjFkDe@KMk@L}BlGuFK}AsB~B_AJwCzCk@BsAnB_AJ_F`DmDaFM_JsBeAfAgAGoCxJjIv@HjHoBn@e@p@wCxA^dAUfCeDjG}DYaAkIcJaFcC{@QuCdCcEJyI[iKwAUyEoOoSC{Cd@cApHkCyDuSkAaPbAeLnFkGrB{DdDsBL_A{@kC]}EsBp@yB@gIqA}FAw@c@E{CvAiEcEgLs@i@kDtAg@c@q@eQuCyJ{@k@mCCm@w@wCuNm@_@eIWoBiA}A{D]wC_BwE_AgS]{@kFuCcABkBnB}AhIoDjDcCxAoAJ{JyCoDNoAa@cD{HiG_FaCBuElAq@kHZqPUwC_A_CiMlD{BFeC}@{@{@wA{DuFRyB]iCkDsBsAyBh@mEtC}BTcC_@uJiOe@aKk@cAsBgA{DWqB{@_DoDyFuLcHaDaBwBsEoPCwAlAaCr@e@lGwBn@cCQwC_EcNUqCTmC~CwKnAwBnBuAjSaFbFmHzFwD~CyEnH]tDqAnEkHhHwGD}Cm@cDyAcC}FaCcCuIoBmAyFv@mK~G_Cx@yJ`AsBe@yHyJwKcDmCcC]cAr@aEFyCbBaJq@mCaB_B{DF}Hw@aBxAi@lCiAtB_AL}HuCgG{@sBqA{CqF_@{Cf@cDvEqI|@oHgAaCwHmCe@_AVaISyCqDiI_GwEYyCvBgHCeFXaAvBqAdIg@hBaAlAwBn@oIq@sF{DyEkCu@qE[a@o@UyCn@sHQaAy@m@eAMuJhCwBA_CeEaEaA}OsJ_CwC_AeCGgAr@cFUyCyFsF_EeAsKhA{DEiTmEcBeBuE{M_H_L?cDlAkHY}CuAmEGyCfHqQl@yYv@mCr@q@hCg@hPdC`C?jNmE~Ld@xFs@zGsCtJkGnAkBOkC}AyAeDmAeLiBgKuJyBzB}@HiR_@sQsFgByAoAcHmAoBuWBkBy@b@ZoAoA}@eCe@gC]gK}BwF_L}HuGuH}LoJ}CeGkEgO_CsDkDoBiIaAgBmAsDwEiF{BgEuD{JcE]cA?kFg@_DaAgCoCyD}FuDqIoCuDsBwJ}AuFwDaBe@{DMsFhAw@Y{@kAg@oKsFeNgAeJkBsCuPeEaG_CkH_F{IiIeCe@wFCqA}AsAsGaByAcEQgYzG{@KqA}Bw@oI{BmMd@{@xA}AbFuClIiIfFmLrK{DzFwEbF{BfByAdHyJbBmGvAeBrBO~Db@xBc@`A}BtAeHhCgGz@mLlCoHhDaErIqDxCeE`@_DUgCuFoIm@yCDuAvDsI`BaHbDqFdBqGv@_@|Fp@xAoB?uAkD_Nw@uF|DiV`BgB~BgAxHeBn@eAh@}CKkDuDcFWoAm@_KHkHhAsC`ByBrIeGvDiG~BaC~LsHJoAwIt@cHKu@d@kA`CcBdBgRnIyGbGwBt@{KEm@e@U{CdByNw@uEaBsAoFVkF{@{@T}DnDiKrDuJ`@{@e@a@{@]{Cc@w@eHyAoFgF{@WyMJkJ{@wD_AuH|@oHEsFgO_B{AcF}BgC\\oFfC{@Bs@a@sHwM_F}CaKY{KhEaGrDC_ApBsAtB_ETkCc@{@cE_DsDkHsDmEwE{BoDY{DoHTeAvBHxAxAm@f@y@E';
-	my $expect_levels = 'G?@@???A??B??A@??@???@??A?@?B????A???@?A????A?@A?@???A@??@@A??????A@@@?A?A@?@?@?B??A??@?A@B?@A?A@??@??B?@??A?@@??@@A??@@?@?A???B?A?@?A???B@@?A???A?A??@?@?@?@?A@?A??@?@?B?A???A??@?B?@@??@?A?@?C?@?A@?@?A@?A???@?A?@???A??B?@??A??@?@@?A??A?@?A?B@??A?@?A??A@?A?@??@A@?@A??C?@??@@?B?@?@@?A?@?C??@A?@@A??A??B?@??A??@??A?@?@??A??@?A?????@??A?@??B?@?@?@??A@@?C??A??@@???@??A??A????A??A?@@?A???A?@A??@A??@?A??@?A?@??@?C?@??@?@?B?@@?A?@??@A???@@?A??@?A?A@??A??A@?B???A???@?@?@?@?G';
-	is( $eline->{num_levels}, 9, 'ex5 num_levels' );
-	is( $eline->{zoom_factor}, 4, 'ex5 zoom_factor' );
-	is_approx( $eline->{points}, $expect_points, 'ex5 points', '25%' );
-	is_approx( $eline->{levels}, $expect_levels, 'ex5 levels', '1%' );
-    }
-}
-
-
 
 __END__
