@@ -15,3 +15,4 @@ t/js_reference/polyline.js
 t/js_reference/test.html
 t/mt_mitchell_csv.t
 t/small_gpx_file.t
+META.json
